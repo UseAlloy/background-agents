@@ -1,7 +1,7 @@
 "use client";
 
 import { toast } from "sonner";
-import { MODEL_OPTIONS } from "@open-inspect/shared/models";
+import { MODEL_OPTIONS, type ValidModel } from "@open-inspect/shared/models";
 import { useEnabledModels } from "@/hooks/use-enabled-models";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -12,19 +12,14 @@ export function ModelsSettings() {
     loading,
     error,
     saving,
-    saveEnabledModels,
+    updateModels,
   } = useEnabledModels();
   const enabledModels = new Set(storedEnabledModels);
 
-  const toggleModel = (modelId: string) => {
-    const next = new Set(enabledModels);
-    if (next.has(modelId)) {
-      if (next.size <= 1) return;
-      next.delete(modelId);
-    } else {
-      next.add(modelId);
-    }
-    void savePreferences(next);
+  const toggleModel = (modelId: ValidModel) => {
+    const enabled = !enabledModels.has(modelId);
+    if (!enabled && enabledModels.size <= 1) return;
+    void savePreferences([{ modelId, enabled }]);
   };
 
   const toggleCategory = (category: (typeof MODEL_OPTIONS)[number], enable: boolean) => {
@@ -37,24 +32,21 @@ export function ModelsSettings() {
       }
     }
     if (next.size === 0) return;
-    void savePreferences(next);
+    void savePreferences(
+      category.models.map((model) => ({ modelId: model.id, enabled: next.has(model.id) }))
+    );
   };
 
-  const savePreferences = async (next: Set<string>) => {
+  const savePreferences = async (changes: Parameters<typeof updateModels>[0]) => {
     try {
-      await saveEnabledModels(Array.from(next));
+      await updateModels(changes);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to save preferences");
     }
   };
 
   if (loading) {
-    return (
-      <div className="flex items-center gap-2 text-muted-foreground">
-        <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-        Loading model preferences...
-      </div>
-    );
+    return <ModelsSettingsSkeleton />;
   }
 
   if (error) {
@@ -87,7 +79,6 @@ export function ModelsSettings() {
                   type="button"
                   variant="subtle"
                   size="xs"
-                  disabled={saving}
                   onClick={() => toggleCategory(group, !allEnabled)}
                   className="text-accent hover:text-accent/80"
                 >
@@ -112,7 +103,6 @@ export function ModelsSettings() {
                       <Switch
                         id={`model-toggle-${model.id}`}
                         checked={isEnabled}
-                        disabled={saving}
                         onCheckedChange={() => toggleModel(model.id)}
                       />
                     </label>
@@ -127,6 +117,44 @@ export function ModelsSettings() {
       <p role="status" className="mt-6 text-sm text-muted-foreground">
         {saving ? "Saving..." : ""}
       </p>
+    </div>
+  );
+}
+
+/** Mirrors the loaded list; the model catalog is static, so every group and row is known. */
+function ModelsSettingsSkeleton() {
+  return (
+    <div
+      role="status"
+      aria-label="Loading model preferences"
+      className="animate-pulse motion-reduce:animate-none"
+    >
+      <div className="h-5 w-40 bg-muted rounded mt-1 mb-2" />
+      <div className="mb-6 py-0.5">
+        <div className="h-4 w-11/12 bg-muted rounded" />
+      </div>
+
+      <div className="space-y-6">
+        {MODEL_OPTIONS.map((group) => (
+          <div key={group.category}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="h-4 w-28 bg-muted rounded" />
+              <div className="h-6 w-16 bg-muted rounded" />
+            </div>
+            <div className="space-y-2">
+              {group.models.map((model) => (
+                <div
+                  key={model.id}
+                  className="flex items-center justify-between px-4 py-3 border border-border"
+                >
+                  <div className="h-4 w-64 max-w-[70%] bg-muted rounded my-1" />
+                  <div className="h-5 w-9 shrink-0 bg-muted rounded-full" />
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

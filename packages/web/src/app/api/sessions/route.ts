@@ -1,6 +1,5 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
-import { getServerAuthSession } from "@/lib/server-auth-session";
 import { controlPlaneUserFetch } from "@/lib/control-plane";
 import { SESSION_LIST_QUERY_PARAMS } from "@open-inspect/shared/session-list-query";
 import { buildControlPlanePath } from "@/lib/control-plane-query";
@@ -32,11 +31,6 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const session = await getServerAuthSession();
-  if (!session) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   try {
     const body = await request.json();
 
@@ -56,7 +50,10 @@ export async function POST(request: NextRequest) {
       environmentId: body.environmentId,
       repositories: body.repositories,
       skillSelection: body.skillSelection,
+      includePersonalMemories: body.includePersonalMemories,
       providerSelections: body.providerSelections,
+      teamId: body.teamId,
+      visibility: body.visibility,
     };
 
     const response = await controlPlaneUserFetch("/sessions", {

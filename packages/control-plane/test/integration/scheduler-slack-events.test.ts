@@ -1,11 +1,21 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { env } from "cloudflare:test";
-import { seedActiveUser, sqlDatabase } from "./helpers";
+import {
+  collectMessages,
+  initNamedSession,
+  openSandboxWs,
+  seedSandboxAuth,
+  waitForSandboxStatus,
+  seedActiveUser,
+  sqlDatabase,
+  closeWebSocket,
+} from "./helpers";
+import { getUserAuth } from "../../src/auth/user/runtime";
 import { AutomationStore, type AutomationRow } from "../../src/db/automation-store";
 import { SlackChannelStore } from "../../src/db/slack-channel-store";
 import type { SlackAutomationEvent } from "@open-inspect/shared/triggers";
 import { cleanD1Tables } from "./cleanup";
-import { Scheduler } from "../../src/scheduler/scheduler";
+import { createScheduler } from "../../src/scheduler/factory";
 import { createCloudflareEnv } from "../../src/cloudflare/platform";
 import { makeRunRow, seedRun, fetchRuns } from "./run-helpers";
 
@@ -13,10 +23,12 @@ function makeAutomation(overrides?: Partial<AutomationRow>): AutomationRow {
   const now = Date.now();
   return {
     id: `auto-${Math.random().toString(36).slice(2, 8)}`,
+    owner_team_id: null,
     name: "Slack triage",
     instructions: "Investigate and fix",
     trigger_type: "slack_event",
     schedule_cron: null,
+    schedule_once_at: null,
     schedule_tz: "UTC",
     harness: "opencode",
     model: "anthropic/claude-sonnet-4-6",
@@ -59,7 +71,7 @@ function makeSlackEvent(overrides?: Partial<SlackAutomationEvent>): SlackAutomat
 }
 
 function sendEvent(event: SlackAutomationEvent) {
-  return new Scheduler(env.DB, createCloudflareEnv(env), { submit() {} }).event(event);
+  return createScheduler(env.DB, createCloudflareEnv(env), { submit() {} }).event(event);
 }
 
 /** Create a watched slack_event automation (channel C1, text_match contains "deploy"). */
@@ -116,7 +128,7 @@ describe("Scheduler slack event handling (integration)", () => {
     const id = await seedSlackAutomation(store);
 
     const result = await sendEvent(makeSlackEvent({ text: "good morning team" }));
-    expect(result).toEqual({ triggered: 0, skipped: 0, steered: 0 });
+    expect(result).toEqual({ triggered: 0, skipped: 0, steered: 0, invocationIds: [] });
 
     expect(await fetchRuns(id)).toHaveLength(0);
   });
@@ -134,20 +146,19 @@ describe("Scheduler slack event handling (integration)", () => {
         concurrencyKey: "slack:C2:1",
       })
     );
-    expect(result).toEqual({ triggered: 0, skipped: 0, steered: 0 });
+    expect(result).toEqual({ triggered: 0, skipped: 0, steered: 0, invocationIds: [] });
 
     expect(await fetchRuns(id)).toHaveLength(0);
   });
 
-  it("falls back to a concurrency skip when the active run has no session to steer", async () => {
+  it("holds a reply until the thread's starting run has queued its first prompt", async () => {
     const store = new AutomationStore(env.DB);
     const id = await seedSlackAutomation(store);
 
-    // A run still in "starting" has not created its session yet, so a follow-up
-    // has nothing to steer and is dropped with the "already active" notice.
-    // (The steering path — where the active run has a session_id — is covered in
-    // the scheduler unit tests with a mocked session, so it doesn't attempt a
-    // real sandbox spawn here.)
+    // A run still in "starting" has not created its session yet. A reply is held
+    // for it rather than dropped with the "already active" notice, and is queued
+    // after the run's own first prompt. (Delivery to a real session is covered by
+    // scheduler-webhook-session.test.ts.)
     const concurrencyKey = "slack:C1:thread-1";
     // The active run's concurrency key lives on its invocation.
     const activeInvId = "inv-active-1";
@@ -171,18 +182,24 @@ describe("Scheduler slack event handling (integration)", () => {
     const result = await sendEvent(
       makeSlackEvent({ text: "deploy", concurrencyKey, triggerKey: "slack:msg:C1:second" })
     );
-    expect(result).toEqual({ triggered: 0, skipped: 1, steered: 0 });
+    expect(result).toEqual({
+      triggered: 0,
+      skipped: 0,
+      steered: 1,
+      invocationIds: [activeInvId],
+    });
 
-    // The skip is a childless invocation carrying the message coordinates.
+    const held = await store.getHeldPrompts("active-1");
+    expect(held).toHaveLength(1);
+    expect(JSON.parse(held[0]!.prompt)).toMatchObject({
+      content: "deploy",
+      source: "slack",
+      callbackContext: { source: "slack", channel: "C1" },
+    });
     const invocations = await fetchInvocations(store, id);
-    const skip = invocations.find(
-      (invocation) => invocation.skipReason === "concurrent_run_active"
-    );
-    expect(skip).toBeDefined();
-    expect(skip!.status).toBe("skipped");
-    expect(skip!.runs).toHaveLength(0);
-    const invocationRow = await store.getInvocationById(skip!.id);
-    expect(JSON.parse(invocationRow!.trigger_metadata!).channel).toBe("C1");
+    expect(
+      invocations.find((invocation) => invocation.skipReason === "concurrent_run_active")
+    ).toBeUndefined();
   });
 
   it("steers the running session when the Slack actor may collaborate", async () => {
@@ -205,7 +222,12 @@ describe("Scheduler slack event handling (integration)", () => {
         triggerKey: "slack:msg:C1:reply",
       })
     );
-    expect(followResult).toEqual({ triggered: 0, skipped: 0, steered: 1 });
+    expect(followResult).toEqual({
+      triggered: 0,
+      skipped: 0,
+      steered: 1,
+      invocationIds: rootResult.invocationIds,
+    });
 
     // No concurrency-skip invocation recorded — the follow-up was steered.
     const invocations = await fetchInvocations(store, id);
@@ -213,6 +235,104 @@ describe("Scheduler slack event handling (integration)", () => {
       invocations.find((invocation) => invocation.skipReason === "concurrent_run_active")
     ).toBeUndefined();
   });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(["unlinked", "ambiguous", "unavailable", "missing-login"])(
+    "clears attribution on successive Slack follow-ups when current GitHub attribution is %s",
+    async (scenario) => {
+      const store = new AutomationStore(env.DB);
+      const automationId = await seedSlackAutomation(store);
+      await env.DB.prepare(
+        `INSERT INTO user_identities
+      (id, user_id, provider, provider_user_id, provider_login, provider_issuer, created_at, updated_at)
+      VALUES ('actor-github', 'slack-actor-1', 'github', '42', 'reviewer', 'https://github.com', 1, 1)`
+      ).run();
+      const name = `slack-attribution-${crypto.randomUUID()}`;
+      const { stub } = await initNamedSession(name, {
+        repoOwner: null,
+        repoName: null,
+        repoId: null,
+        userId: "user-1",
+        canonicalUserId: "user-1",
+      });
+      const concurrencyKey = `slack:C1:${name}`;
+      await seedRun(makeRunRow(automationId, { session_id: name, status: "running" }), {
+        concurrencyKey,
+      });
+      await seedSandboxAuth(stub, { authToken: "slack-sandbox-token", sandboxId: name });
+      const { ws: sandbox } = await openSandboxWs(name, {
+        authToken: "slack-sandbox-token",
+        sandboxId: name,
+      });
+      expect(sandbox).not.toBeNull();
+      sandbox!.accept();
+      try {
+        sandbox!.send(
+          JSON.stringify({ type: "ready", sandboxId: name, timestamp: Date.now() / 1000 })
+        );
+        await waitForSandboxStatus(stub, "ready");
+        const firstCommands = collectMessages(sandbox!, {
+          until: (message) => message.type === "prompt",
+        });
+        expect(
+          await sendEvent(
+            makeSlackEvent({ text: "first follow-up", concurrencyKey, threadTs: name })
+          )
+        ).toMatchObject({ steered: 1, triggered: 0 });
+        const first = (await firstCommands).find((message) => message.type === "prompt");
+        expect(first?.author).toEqual({
+          userId: "slack:U1",
+          gitIdentity: {
+            mode: "attributed-user",
+            name: "Integration User",
+            email: "42+reviewer@users.noreply.github.com",
+          },
+        });
+        if (scenario === "unlinked") {
+          await env.DB.prepare("DELETE FROM user_identities WHERE id = 'actor-github'").run();
+        } else if (scenario === "ambiguous") {
+          await env.DB.prepare(
+            `INSERT INTO user_identities
+          (id, user_id, provider, provider_user_id, provider_login, provider_issuer, created_at, updated_at)
+          VALUES ('actor-github-other', 'slack-actor-1', 'github', '43', 'other', 'https://github.com', 1, 1)`
+          ).run();
+        } else {
+          await env.DB.prepare(
+            "UPDATE user_identities SET provider_login = NULL WHERE id = 'actor-github'"
+          ).run();
+          if (scenario === "unavailable") {
+            vi.spyOn(
+              getUserAuth(createCloudflareEnv(env), env.DB).api,
+              "getAccessToken"
+            ).mockRejectedValue(new Error("Grant temporarily unavailable"));
+          }
+        }
+        const secondCommands = collectMessages(sandbox!, {
+          until: (message) => message.type === "prompt",
+        });
+        expect(
+          await sendEvent(
+            makeSlackEvent({ text: "second follow-up", concurrencyKey, threadTs: name })
+          )
+        ).toMatchObject({ steered: 1, triggered: 0 });
+        sandbox!.send(
+          JSON.stringify({
+            type: "execution_complete",
+            messageId: first!.messageId,
+            success: true,
+            sandboxId: name,
+            timestamp: Date.now() / 1000,
+          })
+        );
+        const second = (await secondCommands).find((message) => message.type === "prompt");
+        expect(second?.author).toEqual({ userId: "slack:U1", gitIdentity: { mode: "agent-only" } });
+        expect(await fetchRuns(automationId)).toHaveLength(1);
+      } finally {
+        await closeWebSocket(sandbox!, { bestEffort: true });
+      }
+    }
+  );
 
   it.each([
     [
@@ -277,7 +397,7 @@ describe("Scheduler slack event handling (integration)", () => {
             triggerKey: `slack:msg:C1:reply-${authorityState}`,
           })
         )
-      ).toEqual({ triggered: 0, skipped: 0, steered: 0 });
+      ).toEqual({ triggered: 0, skipped: 1, steered: 0, invocationIds: [] });
       expect(await fetchRuns(id)).toHaveLength(1);
       expect(await fetchInvocations(store, id)).toHaveLength(1);
     }
@@ -287,15 +407,14 @@ describe("Scheduler slack event handling (integration)", () => {
     const store = new AutomationStore(env.DB);
     const id = await seedSlackAutomation(store);
     const concurrencyKey = "slack:C1:thread-actor-only";
-    expect(
-      await sendEvent(
-        makeSlackEvent({
-          text: "deploy the api",
-          concurrencyKey,
-          triggerKey: "slack:msg:C1:root-actor-only",
-        })
-      )
-    ).toMatchObject({ triggered: 1 });
+    const rootResult = await sendEvent(
+      makeSlackEvent({
+        text: "deploy the api",
+        concurrencyKey,
+        triggerKey: "slack:msg:C1:root-actor-only",
+      })
+    );
+    expect(rootResult).toMatchObject({ triggered: 1 });
 
     await env.DB.batch([
       env.DB.prepare(
@@ -322,7 +441,7 @@ describe("Scheduler slack event handling (integration)", () => {
           triggerKey: "slack:msg:C1:reply-actor-only",
         })
       )
-    ).toEqual({ triggered: 0, skipped: 0, steered: 1 });
+    ).toEqual({ triggered: 0, skipped: 0, steered: 1, invocationIds: rootResult.invocationIds });
     expect(await fetchRuns(id)).toHaveLength(1);
   });
 
@@ -363,6 +482,7 @@ describe("Scheduler slack event handling (integration)", () => {
       triggered: 0,
       skipped: 0,
       steered: 1,
+      invocationIds: rootResult.invocationIds,
     });
 
     // The reply created no new run and recorded no skip — it reused the

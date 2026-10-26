@@ -56,13 +56,13 @@ cloudflare_worker_subdomain = ""
 # vercel_team_id = ""  # e.g., "team_xxxxxxxxxxxxxxxxxxxx"
 
 # Modal API token
-# Only required when sandbox_provider = "modal"
+# Only required when sandbox_provider = "modal" or "modal-vm"
 # Create at: https://modal.com/settings
 modal_token_id = ""
 modal_token_secret = ""
 
 # Modal workspace, environment, and endpoint web suffix
-# Only required when sandbox_provider = "modal"
+# Only required when sandbox_provider = "modal" or "modal-vm"
 # workspace: your Modal username (e.g., "myworkspace")
 # environment: Modal environment name used by the CLI
 # environment_web_suffix: Modal web suffix used in endpoint URLs:
@@ -79,8 +79,13 @@ modal_environment_web_suffix  = ""
 # Seed the base snapshot with packages/daytona-infra/src/bootstrap.py before enabling.
 daytona_api_url = ""           # e.g., "https://app.daytona.io/api"
 daytona_api_key = ""           # Requires Sandboxes (Read/Write) + Snapshots (Read/Write/Delete)
-daytona_base_snapshot = ""     # Name of the seeded Daytona snapshot
+daytona_base_snapshot = ""     # Prefix for the Terraform-managed Daytona snapshot
+# daytona_base_snapshot_memory_gib = 2 # Memory inherited by sandboxes created from the snapshot
 # daytona_target = ""          # Optional Daytona target name
+# daytona_toolbox_api_url = "" # Optional override; empty uses the proxy each sandbox reports
+# Admits new Daytona prebuilt-image builds and lets fresh sessions boot from one; closing it
+# again is the rollback. Clear the gates in docs/IMAGE_PREBUILD.md#daytona-prebuilds first.
+daytona_prebuilds_enabled = false
 
 # Vercel Sandbox API
 # Only required when sandbox_provider = "vercel"
@@ -92,13 +97,6 @@ vercel_sandbox_project_id = "" # e.g., "prj_xxxxxxxxxxxxxxxxxxxx"
 # vercel_base_snapshot_id = "" # Optional manual override; skips Terraform-managed snapshot builds
 # vercel_sandbox_runtime  = "node24"
 # vercel_snapshot_expiration_ms = 0
-
-# OpenComputer REST API
-# Only required when sandbox_provider = "opencomputer"
-# The template must include the OpenInspect sandbox runtime entrypoint.
-opencomputer_api_url = "https://app.opencomputer.dev/api"
-opencomputer_api_key = ""
-opencomputer_template = ""
 
 # E2B
 # Only required when sandbox_provider = "e2b"
@@ -114,6 +112,30 @@ e2b_template_id = ""           # e.g., "open-inspect-sandbox"
 # Auto-pause makes a lapsed TTL recoverable (pause, not kill) and auto-resumes the
 # sandbox on inbound activity. Default true; set false to kill on timeout.
 # e2b_auto_pause = true
+
+# Boat
+# Only required when sandbox_provider = "boat"
+# - boat_api_key: runtime key (control-plane → Boat API, sandbox access password HMAC)
+#                 AND snapshot-build auth. Dashboard → API keys.
+# The boat-infra Terraform module builds the saved snapshot automatically;
+# boat_base_snapshot is the prefix of the name it saves (and the one fresh
+# sandboxes deploy from). 1-46 lowercase letters, digits or dashes.
+# Base prefixes oi-img and oi-img-* are reserved for prebuilt images and rejected.
+# Use a unique prefix per deployment sharing a Boat account or organization wallet
+# to avoid deleting another deployment's live base. After the Worker switches,
+# Terraform prunes exact <prefix>-<16 lowercase hex> names, retaining the deployed
+# base and the base it actually replaced, using confirmed Worker deployment history.
+# Snapshot name, API URL or organization changes trigger cleanup, not credentials alone.
+# Saving snapshots, manual names and other scopes are untouched.
+# See docs/BOAT_SANDBOX_PROVIDER.md#base-snapshot-pruning.
+boat_api_key = ""              # sensitive — runtime REST API key (also auths the build)
+boat_base_snapshot = ""        # e.g., "open-inspect"
+# boat_api_url = "https://boat.dev/api/v1"
+# boat_org = ""                # Optional organization wallet; empty uses the active one.
+#                              # Sandboxes are created private, whatever its default.
+# Machine size for sessions that request no CPU or memory; a request picks the
+# smallest size that fits it. One of small, default, large, xlarge.
+# boat_sandbox_type = "default"
 
 # =============================================================================
 # GitHub App Credentials
@@ -232,9 +254,8 @@ linear_webhook_secret = ""   # Webhook Signing Secret from the application confi
 # API Keys
 # =============================================================================
 
-# Anthropic API key for Claude. Injected into Modal session sandboxes and
-# OpenComputer sandboxes; Daytona, E2B and Vercel read model keys only from the
-# secret store in the web app, which overrides this value everywhere. Optional:
+# Anthropic API key for Claude. Injected into Modal session sandboxes; Daytona,
+# E2B and Vercel read model keys only from the secret store in the web app, which overrides this value everywhere. Optional:
 # leave it blank to supply model credentials as secrets instead. Required only
 # when classification_model names an Anthropic model AND at least one of the
 # Slack or Linear bots is enabled. Both of those are the defaults, so a stock
@@ -242,17 +263,37 @@ linear_webhook_secret = ""   # Webhook Signing Secret from the application confi
 # From: https://console.anthropic.com/
 anthropic_api_key = ""
 
+# Anthropic credential used only by the Slack/Linear bot classifiers; never
+# injected into sandboxes. Falls back to anthropic_api_key when blank. Set this
+# and leave anthropic_api_key blank to keep the classifier key out of sandboxes.
+# classification_anthropic_api_key = ""
+
 # OpenAI credential for the Slack/Linear bot classifiers. Required when
 # classification_model names an OpenAI model AND at least one of the Slack or
 # Linear bots is enabled; an Anthropic classifier model is served by
-# anthropic_api_key above.
+# classification_anthropic_api_key or anthropic_api_key above.
 # From: https://platform.openai.com/api-keys
 classification_openai_api_key = ""
 
+# Amazon Bedrock API key for the Slack/Linear bot classifiers. Required when
+# classification_model is a "bedrock/<aws-region>/<inference-profile-id>" id AND
+# at least one of the Slack or Linear bots is enabled. For the key type and IAM
+# permissions, see "Classify on Amazon Bedrock (Optional)" in
+# docs/GETTING_STARTED.md.
+# classification_bedrock_api_key = ""
+
 # Model backing the Slack/Linear bot classifiers. A "claude-"/"anthropic/" id is
-# served by anthropic_api_key; a "gpt-"/"openai/" id by
-# classification_openai_api_key.
+# served by classification_anthropic_api_key or anthropic_api_key; a
+# "gpt-"/"openai/" id by classification_openai_api_key; a
+# "bedrock/<aws-region>/<inference-profile-id>" id by
+# classification_bedrock_api_key, through Claude in Amazon Bedrock in that Region.
 # classification_model = "claude-haiku-4-5"
+# classification_model = "bedrock/us-east-1/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+# Reasoning effort for an OpenAI classification_model, sent as reasoning_effort.
+# Leave blank to use the model's default. Not supported for Anthropic or Bedrock
+# models.
+# classification_reasoning_effort = "low"
 
 # =============================================================================
 # Security Secrets
@@ -271,7 +312,7 @@ repo_secrets_encryption_key = ""
 provider_accounts_encryption_key = ""
 
 # Modal API secret (for control plane -> Modal authentication)
-# Only required when sandbox_provider = "modal"
+# Only required when sandbox_provider = "modal" or "modal-vm"
 # Generate with: openssl rand -hex 32
 modal_api_secret = ""
 
@@ -286,8 +327,9 @@ nextauth_secret = ""
 # - "modal": existing Modal-based sandboxes with filesystem snapshot restore
 # - "daytona": direct Daytona REST API integration with stop/start resume
 # - "vercel": Vercel Sandbox API with filesystem snapshot restore
-# - "opencomputer": OpenComputer declarative-template sandboxes with hibernate/resume
 # - "e2b": direct E2B REST API integration with pause/resume
+# - "boat": direct Boat REST API integration with stop/resume (archived snapshot)
+# Select "modal-vm" for Docker-capable VMs (deployment-wide; see docs/MODAL_DOCKER.md).
 sandbox_provider = "modal"
 
 # Platform for the web app deployment

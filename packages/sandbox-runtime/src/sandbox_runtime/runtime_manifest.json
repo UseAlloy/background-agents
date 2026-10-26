@@ -1,9 +1,12 @@
 {
-  "runtimeVersion": "v64-claude-harness",
-  "generation": 64,
+  "runtimeVersion": "v77-codex-pinned-binary",
+  "generation": 77,
   "minimumCompatibleGeneration": 62,
-  "minimumRebuildGeneration": 64,
+  "minimumPreservationGeneration": 71,
+  "minimumRebuildGeneration": 77,
   "harnessMinimumGeneration": {
-    "claude": 64
+    "claude": 76,
+    "opencode": 76,
+    "codex": 77
   }
 }

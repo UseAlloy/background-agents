@@ -47,6 +47,7 @@
 
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { z } from "zod";
 import { ensurePrivateDirectory } from "./private-paths";
 import { openPrivateSqliteFile } from "./sqlite-file";
 
@@ -86,6 +87,55 @@ export interface JobStoreStats {
    * is how a stranded job gets noticed.
    */
   oldestRunnableLagMs: number | null;
+}
+
+const claimedJobRowSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  payload: z.string(),
+  attempts: z.number().int().positive(),
+});
+
+const jobIdRowSchema = z.object({ id: z.string() });
+const nullableRunAtRowSchema = z.object({ run_at: z.number().int().nullable() });
+const statusCountRowSchema = z.object({
+  status: z.enum(["pending", "running", "dead"]),
+  count: z.number().int().nonnegative(),
+});
+
+export function parseClaimedJobRow(row: unknown, token: string): ClaimedJob {
+  const parsed = claimedJobRowSchema.safeParse(row);
+  if (!parsed.success) {
+    throw new Error("Malformed claimed job row", { cause: parsed.error });
+  }
+  return { ...parsed.data, token };
+}
+
+export function parseJobIdRows(rows: unknown[]): string[] {
+  return rows.flatMap((row) => {
+    const parsed = jobIdRowSchema.safeParse(row);
+    if (parsed.success) return [parsed.data.id];
+    // Recovery has already released the batch. The claim path will bury this
+    // row; don't prevent healthy jobs from recovering in the meantime.
+    console.error("Malformed recovered job id row", parsed.error);
+    return [];
+  });
+}
+
+export function parseNullableRunAtRow(row: unknown, description: string): number | null {
+  const parsed = nullableRunAtRowSchema.safeParse(row);
+  if (!parsed.success) {
+    throw new Error(`Malformed ${description}`, { cause: parsed.error });
+  }
+  return parsed.data.run_at;
+}
+
+export function parseStatusCountRows(rows: unknown): Array<{ status: string; count: number }> {
+  const parsed = z.array(statusCountRowSchema).safeParse(rows);
+  if (!parsed.success) {
+    throw new Error("Malformed job status count rows", { cause: parsed.error });
+  }
+  return parsed.data;
 }
 
 export interface JobStore {
@@ -228,20 +278,22 @@ export function openJobStore(dataDir: string): JobStore {
     earliest: (kinds) =>
       kinds.length === 0
         ? null
-        : (soonestFor(kinds.length).get(...kinds) as { run_at: number | null }).run_at,
+        : parseNullableRunAtRow(soonestFor(kinds.length).get(...kinds), "earliest job row"),
     claim: (now, limit, kinds, leaseUntil) => {
       if (kinds.length === 0) return [];
       const token = crypto.randomUUID();
       return claimFor(kinds.length)
         .all(token, leaseUntil, now, ...kinds, limit)
-        .map((row) => {
-          const { id, kind, payload, attempts } = row as {
-            id: string;
-            kind: string;
-            payload: string;
-            attempts: number;
-          };
-          return { id, kind, payload, attempts, token };
+        .flatMap((row) => {
+          try {
+            return [parseClaimedJobRow(row, token)];
+          } catch {
+            // Claiming already leased the entire batch. Quarantine a corrupt
+            // row without discarding healthy deliveries or spending their
+            // retry budgets on work the poller never received.
+            kill.run("Malformed claimed job row", row.id, token);
+            return [];
+          }
         });
     },
     complete: (id, token) => {
@@ -253,14 +305,13 @@ export function openJobStore(dataDir: string): JobStore {
     bury: (id, token, error) => {
       kill.run(error, id, token);
     },
-    recoverAllClaims: () => (recoverAll.all() as Array<{ id: string }>).map((row) => row.id),
-    recoverExpiredClaims: (now) =>
-      (recoverExpired.all(now) as Array<{ id: string }>).map((row) => row.id),
+    recoverAllClaims: () => parseJobIdRows(recoverAll.all()),
+    recoverExpiredClaims: (now) => parseJobIdRows(recoverExpired.all(now)),
     stats: (now) => {
-      const counts = countByStatus.all() as Array<{ status: string; count: number }>;
+      const counts = parseStatusCountRows(countByStatus.all());
       const countOf = (status: string): number =>
         counts.find((row) => row.status === status)?.count ?? 0;
-      const oldest = (oldestRunnable.get(now) as { run_at: number | null }).run_at;
+      const oldest = parseNullableRunAtRow(oldestRunnable.get(now), "oldest runnable job row");
       return {
         pending: countOf("pending"),
         running: countOf("running"),
