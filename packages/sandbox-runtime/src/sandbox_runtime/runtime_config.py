@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
+from .constants import DOCKER_ENABLED_ENV_VAR
 from .harness.base import HarnessId, parse_harness_id
 
 
@@ -84,6 +85,12 @@ class ClaudeStagerConfig:
 
 
 @dataclass(frozen=True)
+class CodexStagerConfig:
+    has_repository: bool
+    mcp_servers: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
 class ManagedSkillsConfig:
     control_plane_url: str
     sandbox_token: str
@@ -110,6 +117,9 @@ class RuntimeConfig:
     session_config: Mapping[str, Any]
     workspace_path: Path
     repo_path: Path
+    # Set by the provider, never by user configuration: this sandbox runs on a
+    # Docker-capable runtime and must own a daemon before repository hooks.
+    docker_enabled: bool = False
 
     @classmethod
     def from_env(
@@ -137,6 +147,7 @@ class RuntimeConfig:
             session_config=session_config,
             workspace_path=workspace_path,
             repo_path=repo_path,
+            docker_enabled=environment.get(DOCKER_ENABLED_ENV_VAR) == "true",
         )
 
     @property
@@ -155,6 +166,16 @@ class RuntimeConfig:
     def harness(self) -> HarnessId:
         """Which agent runs this session; absent means the built-in OpenCode harness."""
         return parse_harness_id(self.session_config.get("harness"))
+
+    @property
+    def bridge_early_connect(self) -> bool:
+        """The control plane asked for the bridge to connect ahead of the repository boot.
+
+        Only a boolean ``true`` opts in: a control plane that does not know
+        the field leaves it absent, and the runtime then boots in the
+        classic order (bridge last), which every control plane understands.
+        """
+        return self.session_config.get("bridge_early_connect") is True
 
     def repository_config(self) -> RepositoryConfig:
         raw_repositories = self.session_config.get("repositories")
@@ -176,29 +197,32 @@ class RuntimeConfig:
             repo_path=self.repo_path,
         )
 
-    def opencode_config(self) -> OpenCodeConfig:
+    def _mcp_servers(self) -> tuple[Mapping[str, Any], ...]:
         raw_mcp_servers = self.session_config.get("mcp_servers")
-        mcp_servers = (
+        return (
             tuple(item for item in raw_mcp_servers if isinstance(item, Mapping))
             if isinstance(raw_mcp_servers, tuple)
             else ()
         )
+
+    def opencode_config(self) -> OpenCodeConfig:
         return OpenCodeConfig(
             provider=str(self.session_config.get("provider") or "anthropic"),
             model=str(self.session_config.get("model") or "claude-sonnet-4-6"),
-            mcp_servers=mcp_servers,
+            mcp_servers=self._mcp_servers(),
             has_repository=self.has_repository,
             workspace_path=self.workspace_path,
         )
 
     def claude_stager_config(self) -> ClaudeStagerConfig:
-        raw_mcp_servers = self.session_config.get("mcp_servers")
-        mcp_servers = (
-            tuple(item for item in raw_mcp_servers if isinstance(item, Mapping))
-            if isinstance(raw_mcp_servers, tuple)
-            else ()
+        return ClaudeStagerConfig(
+            has_repository=self.has_repository, mcp_servers=self._mcp_servers()
         )
-        return ClaudeStagerConfig(has_repository=self.has_repository, mcp_servers=mcp_servers)
+
+    def codex_stager_config(self) -> CodexStagerConfig:
+        return CodexStagerConfig(
+            has_repository=self.has_repository, mcp_servers=self._mcp_servers()
+        )
 
     def bridge_process_config(self) -> BridgeProcessConfig:
         return BridgeProcessConfig(

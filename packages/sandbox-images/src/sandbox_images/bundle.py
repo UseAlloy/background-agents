@@ -10,12 +10,13 @@ import shutil
 import stat
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple, TypedDict
 
 from .configuration import IMAGE_PACKAGE, RUNTIME_PACKAGE, read_json, runtime_environment
 from .locks import update_locks
 
-PROVIDERS = ("modal", "daytona", "e2b", "vercel", "opencomputer")
+DOCKER_PACKAGES = ("engine", "cli", "containerd", "buildx", "compose")
+PROVIDERS = ("modal", "daytona", "e2b", "vercel", "boat")
 EXCLUDED = {
     ".terraform",
     ".git",
@@ -42,8 +43,29 @@ INFRA_MODULES = {
     "daytona": "daytona-infra",
     "e2b": "e2b-infra",
     "vercel": "vercel-sandbox-infra",
-    "opencomputer": "opencomputer-infra",
+    "boat": "boat-infra",
 }
+
+
+class ImageTarget(TypedDict):
+    os: str
+    base: str
+    node: str
+    user: str
+    home: str
+
+
+class ImagePlan(TypedDict):
+    provider: str
+    target: ImageTarget
+    runtimeVersion: str
+    runtimeEnv: dict[str, str]
+    buildHash: str
+
+
+class PackedBundle(NamedTuple):
+    directory: Path
+    plan: ImagePlan
 
 
 def validate_toolchain(tools: dict[str, Any]) -> None:
@@ -58,12 +80,15 @@ def validate_toolchain(tools: dict[str, Any]) -> None:
         raise ValueError("OpenCode is below the image toolchain minimum")
     for name in ("agentBrowser", "pnpm", "bun", "zod", "python"):
         version(tools[name])
+    for pin in tools["npmOverrides"].values():
+        version(pin)
     if not re.fullmatch(r"[a-f0-9]{64}", tools.get("agentBrowserSha256", "")):
         raise ValueError("agent-browser native binary must have a SHA-256 pin")
     archives = [
         tools[name]
         for name in (
             "uv",
+            "codex",
             "codeServer",
             "ttyd",
             "chrome",
@@ -78,6 +103,18 @@ def validate_toolchain(tools: dict[str, Any]) -> None:
         version(pin["version"])
         if not re.fullmatch(r"[a-f0-9]{64}", pin["sha256"]):
             raise ValueError("Downloaded image tools must have a SHA-256 pin")
+    # The optional Docker variant installs pinned Debian packages, never a
+    # convenience script or an unpinned apt repository.
+    docker = tools.get("docker")
+    if not isinstance(docker, dict) or set(docker) != set(DOCKER_PACKAGES):
+        raise ValueError(
+            "Docker packages must pin exactly the engine, cli, containerd, buildx and compose"
+        )
+    for pin in docker.values():
+        if not re.fullmatch(r"[a-z0-9_.~+-]+_amd64\.deb", pin.get("file", "")):
+            raise ValueError("Docker packages must be pinned Debian amd64 artifacts")
+        if not re.fullmatch(r"[a-f0-9]{64}", pin.get("sha256", "")):
+            raise ValueError("Docker packages must have a SHA-256 pin")
 
 
 def source_files(root: Path, paths: tuple[Path, ...]) -> list[Path]:
@@ -106,7 +143,7 @@ def source_files(root: Path, paths: tuple[Path, ...]) -> list[Path]:
     return files
 
 
-def plan_image(root: Path, provider: str) -> dict[str, Any]:
+def plan_image(root: Path, provider: str) -> ImagePlan:
     root = root.resolve()
     if provider not in PROVIDERS:
         raise ValueError(f"Unsupported sandbox image provider: {provider}")
@@ -123,10 +160,9 @@ def plan_image(root: Path, provider: str) -> dict[str, Any]:
         Path(f"packages/{provider}-infra"),
         Path(f"terraform/modules/{INFRA_MODULES[provider]}"),
     )
-    if provider in ("vercel", "opencomputer"):
-        paths += (Path("package-lock.json"),)
     if provider == "vercel":
         paths += (
+            Path("package-lock.json"),
             Path("packages/control-plane/src"),
             Path("packages/shared/src"),
             Path("packages/control-plane/scripts/build-vercel-base-snapshot.ts"),
@@ -151,7 +187,7 @@ def plan_image(root: Path, provider: str) -> dict[str, Any]:
     }
 
 
-def pack_bundle(root: Path, provider: str, output_root: Path) -> Path:
+def pack_bundle(root: Path, provider: str, output_root: Path) -> PackedBundle:
     """Create a fresh context for each caller; no shared cache to reconcile."""
     root = root.resolve()
     update_locks(root, check=True)
@@ -179,6 +215,7 @@ def pack_bundle(root: Path, provider: str, output_root: Path) -> Path:
             ("NODE", "node"),
             ("UV", "uv"),
             ("CODE_SERVER", "codeServer"),
+            ("CODEX", "codex"),
             ("TTYD", "ttyd"),
             ("FLUXBOX", "fluxbox"),
             ("LIBVNCSERVER", "libvncserver"),
@@ -189,12 +226,16 @@ def pack_bundle(root: Path, provider: str, output_root: Path) -> Path:
             pin = toolchain[key][plan["target"]["node"]] if key == "node" else toolchain[key]
             variables[f"{name}_VERSION"] = pin["version"]
             variables[f"{name}_SHA256"] = pin["sha256"]
+        for package in DOCKER_PACKAGES:
+            pin = toolchain["docker"][package]
+            variables[f"DOCKER_{package.upper()}_FILE"] = pin["file"]
+            variables[f"DOCKER_{package.upper()}_SHA256"] = pin["sha256"]
         (destination / "image-config.sh").write_text(
             "\n".join(f"export {key}={shlex.quote(value)}" for key, value in variables.items())
             + "\n"
         )
 
-        return destination
+        return PackedBundle(destination, plan)
     except BaseException:
         shutil.rmtree(destination)
         raise

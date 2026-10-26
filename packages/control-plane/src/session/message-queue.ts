@@ -1,7 +1,11 @@
 import {
-  checkHarnessCompatibility,
+  checkHarnessPromptCompatibility,
+  resolveHarnessModel,
+  getHarnessCapabilities,
+  getHarnessReasoningConfig,
   getValidHarnessOrDefault,
 } from "@open-inspect/shared/harnesses";
+import { inheritReasoningEffort } from "../harness-admission";
 import { generateId, hashToken } from "../auth/crypto";
 import type { SessionIndexStore } from "../db/session-index";
 import type { Logger } from "../logger";
@@ -15,7 +19,6 @@ import { githubAutofixOriginSchema } from "@open-inspect/shared";
 import {
   DEFAULT_MODEL,
   getDefaultReasoningEffort,
-  getValidModelOrDefault,
   isValidModel,
 } from "@open-inspect/shared/models";
 import type { SandboxEvent } from "@open-inspect/shared/types/sandbox-events";
@@ -28,6 +31,7 @@ import type { ParticipantRow, PromptGitIdentity, SandboxCommand, SessionRow } fr
 import type { SessionCoreRepository } from "./session-core-repository";
 import type { ParticipantRepository } from "./participant-repository";
 import type { MessageRepository } from "./message-repository";
+import { applySandboxRecovery } from "./sandbox-recovery";
 import {
   AttachmentClaimConflictError,
   type SessionAttachmentRepository,
@@ -43,6 +47,7 @@ import { resolveParticipantName } from "./participant-name";
 import type { AlarmScheduler, BackgroundTasks, SessionWebSocket } from "../platform-ports";
 import type { ExecutionStopCoordinator } from "./execution-stop-coordinator";
 import type { MessageFailureService } from "./message-failure-service";
+import { sandboxBootPhaseLogFields } from "../sandbox/boot-phase";
 import { resolveGitAuthorIdentity } from "./identity";
 import { validateReasoningEffort } from "./reasoning-effort";
 import {
@@ -73,6 +78,13 @@ export class SessionNotPromptableError extends Error {
   constructor(readonly sessionStatus: SessionRow["status"]) {
     super(`Cannot prompt a ${sessionStatus} session`);
     this.name = "SessionNotPromptableError";
+  }
+}
+
+export class SandboxPromptBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxPromptBlockedError";
   }
 }
 
@@ -162,7 +174,9 @@ export class SessionMessageQueue {
     private readonly alarmScheduler: AlarmScheduler,
     private readonly executionStop: ExecutionStopCoordinator,
     /** Resolved per use so it honors settings persisted after construction. */
-    private readonly getExecutionTimeoutMs: () => number
+    private readonly getExecutionTimeoutMs: () => number,
+    private readonly mayDispatch: () => boolean,
+    private readonly getSandboxPromptBlockReason: () => string | null
   ) {}
 
   async enqueueAutofix(
@@ -170,6 +184,13 @@ export class SessionMessageQueue {
   ): Promise<EnqueueAutofixResponse> {
     const session = this.repository.getSession();
     const userId = `github:${command.author.id}`;
+    const harness = getValidHarnessOrDefault(session?.harness);
+    const selectionError =
+      getHarnessCapabilities(harness).selectionPolicy === "strict"
+        ? await this.getProviderAuthenticationError(session?.model ?? DEFAULT_MODEL)
+        : null;
+    const currentSession = this.repository.getSession();
+    const recoveryHold = this.getSandboxPromptBlockReason() !== null || selectionError !== null;
     const now = Date.now();
     const admission = this.messageRepository.admitAutofixMessage({
       message: {
@@ -196,19 +217,34 @@ export class SessionMessageQueue {
       originContext: JSON.stringify(command.origin),
       attemptLimit: command.attemptLimit,
       windowStart: now - AUTOFIX_ATTEMPT_WINDOW_MS,
-      sessionClosed: !session || session.status === "archived" || session.status === "cancelled",
+      sessionClosed:
+        !currentSession ||
+        currentSession.status === "archived" ||
+        currentSession.status === "cancelled",
     });
-    if (admission.kind === "rejected") return admission;
+    const logFields = {
+      feedback_key: command.feedbackKey,
+      pull_request_number: command.pullRequest.number,
+      artifact_id: command.pullRequest.artifactId,
+      recovery_hold: recoveryHold,
+    };
+    if (admission.kind === "rejected") {
+      this.log.info("autofix.rejected", {
+        event: "autofix.rejected",
+        ...logFields,
+        reason: admission.reason,
+      });
+      return admission;
+    }
 
+    this.log.info("autofix.enqueue", {
+      event: "autofix.enqueue",
+      ...logFields,
+      message_id: admission.messageId,
+      outcome: admission.kind,
+    });
     if (admission.kind === "enqueued") {
       this.broadcastPromptQueue();
-      this.log.info("autofix.enqueue", {
-        event: "autofix.enqueue",
-        feedback_key: command.feedbackKey,
-        message_id: admission.messageId,
-        pull_request_number: command.pullRequest.number,
-        artifact_id: command.pullRequest.artifactId,
-      });
     }
     await this.redrivePendingAutofix(admission.messageId);
     return admission;
@@ -228,7 +264,9 @@ export class SessionMessageQueue {
     const session = this.repository.getSession();
     if (!session || session.status === "archived" || session.status === "cancelled") return;
 
+    // Retry pending-work status projection even while recovery prevents dispatch.
     await this.sessionStatus.transition("active");
+    if (this.getSandboxPromptBlockReason()) return;
     await this.processMessageQueue();
   }
 
@@ -240,6 +278,7 @@ export class SessionMessageQueue {
     let enqueued: EnqueuedPrompt;
     try {
       this.assertPromptableSession();
+      this.assertSandboxAcceptingPrompts();
       let participant = this.participantRepository.getParticipantById(client.participantId);
       participant ??= this.participantService.getByUserId(client.userId);
       if (!participant) {
@@ -271,6 +310,15 @@ export class SessionMessageQueue {
         this.wsManager.send(ws, {
           type: "error",
           code: "SESSION_NOT_PROMPTABLE",
+          message: error.message,
+          clientRequestId: data.clientRequestId,
+        });
+        return;
+      }
+      if (error instanceof SandboxPromptBlockedError) {
+        this.wsManager.send(ws, {
+          type: "error",
+          code: "SANDBOX_RECOVERY_REQUIRED",
           message: error.message,
           clientRequestId: data.clientRequestId,
         });
@@ -315,14 +363,7 @@ export class SessionMessageQueue {
       throw error;
     }
 
-    const session = this.repository.getSession();
-    const sessionId = session?.session_name || session?.id;
-    if (sessionId) {
-      this.backgroundTasks.submit(() => this.sessionIndex.touchUpdatedAt(sessionId), {
-        name: "session_index.touch_updated_at",
-        context: { session_id: sessionId },
-      });
-    }
+    this.touchSessionActivity();
 
     this.wsManager.send(ws, {
       type: "prompt_queued",
@@ -363,6 +404,7 @@ export class SessionMessageQueue {
   }
 
   async processMessageQueue(): Promise<void> {
+    if (!this.mayDispatch()) return;
     const currentSession = this.repository.getSession();
     if (!currentSession || !isSessionPromptable(currentSession.status)) {
       return;
@@ -391,15 +433,23 @@ export class SessionMessageQueue {
     }
     const now = Date.now();
     const session = this.repository.getSession();
-    const resolvedModel = getValidModelOrDefault(message.model || session?.model);
+    const harness = getValidHarnessOrDefault(session?.harness);
+    const resolvedModel = resolveHarnessModel(harness, message.model || session?.model);
+    const inheritedReasoningEffort = inheritReasoningEffort(
+      harness,
+      resolvedModel,
+      session?.reasoning_effort
+    );
     // The same rule as admission, applied at dispatch: the harness is fixed
     // at create, so nothing may reach the sandbox on a model it cannot run.
-    const harnessIncompatibility = checkHarnessCompatibility(
-      getValidHarnessOrDefault(session?.harness),
-      resolvedModel
+    const harnessIncompatibility = checkHarnessPromptCompatibility(
+      harness,
+      resolvedModel,
+      message.reasoning_effort ?? inheritedReasoningEffort
     );
     const authenticationError =
       harnessIncompatibility?.message ?? (await this.getProviderAuthenticationError(resolvedModel));
+    if (!this.mayDispatch()) return;
     if (this.repository.getSession()?.budget_exhausted === 1) return;
     if (authenticationError) {
       this.log.error("provider_auth.unavailable", {
@@ -413,8 +463,21 @@ export class SessionMessageQueue {
       }
       return;
     }
-    const sandboxWs = this.wsManager.getSandboxSocket();
-    if (!sandboxWs) {
+    const target = this.wsManager.getSandboxCommandTarget();
+    if (target.kind === "booting") {
+      // A bridge is attached ahead of its boot. Nothing to spawn and nothing
+      // to send: the runtime's `ready` event pumps this queue when the
+      // harness is up, and the lifecycle alarms decide if the boot died.
+      this.log.info("prompt.dispatch", {
+        event: "prompt.dispatch",
+        message_id: message.id,
+        outcome: "deferred",
+        reason: "sandbox_booting",
+        ...sandboxBootPhaseLogFields(target.phase),
+      });
+      return;
+    }
+    if (target.kind === "unavailable") {
       // The provider-auth lookup above is a non-storage await. The socket
       // path re-validates through the processing claim; this path has no
       // claim, so it re-reads what it acts on: a cancel or archive that
@@ -440,7 +503,6 @@ export class SessionMessageQueue {
         outcome: "deferred",
         reason: "no_sandbox",
       });
-      this.messenger.broadcast({ type: "sandbox_spawning" });
       // Spawn in the background: a snapshot restore can take tens of seconds,
       // and awaiting it here holds the prompt HTTP response open past bot
       // callers' request timeouts. The message is already persisted as
@@ -465,6 +527,7 @@ export class SessionMessageQueue {
       return;
     }
 
+    const sandboxWs = target.socket;
     const author = this.participantRepository.getParticipantById(message.author_id);
     if (!author) {
       throw new Error(`Missing prompt author ${message.author_id}`);
@@ -482,10 +545,12 @@ export class SessionMessageQueue {
     const gitIdentity = resolveParticipantGitIdentity(author, this.scmProvider);
     const requestedEffort =
       message.reasoning_effort ??
-      session?.reasoning_effort ??
+      inheritedReasoningEffort ??
+      getHarnessReasoningConfig(harness, resolvedModel)?.default ??
       getDefaultReasoningEffort(resolvedModel);
     const resolvedEffort =
-      validateReasoningEffort(resolvedModel, requestedEffort ?? undefined, this.log) ?? undefined;
+      validateReasoningEffort(resolvedModel, requestedEffort ?? undefined, this.log, harness) ??
+      undefined;
 
     const command: SandboxCommand = {
       type: "prompt",
@@ -502,6 +567,7 @@ export class SessionMessageQueue {
       ),
     };
 
+    if (!this.mayDispatch()) return;
     const claimed = this.messageRepository.startMessageProcessing(
       message.id,
       now,
@@ -523,6 +589,16 @@ export class SessionMessageQueue {
       this.messenger.broadcast({ type: "processing_status", isProcessing: true });
       this.broadcastPromptQueue();
       this.sandboxLifecycle.updateLastActivity(now);
+      try {
+        this.sandboxLifecycle.onPromptDispatched();
+      } catch (error) {
+        // The prompt is already running; a failed breaker reset must not skip its deadline.
+        this.log.warn("prompt.circuit_breaker_reset_failed", {
+          event: "prompt.circuit_breaker_reset_failed",
+          message_id: message.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
 
       // Execution timeout shares the DO's single alarm slot with lifecycle checks.
       const deadline = now + this.getExecutionTimeoutMs();
@@ -551,9 +627,21 @@ export class SessionMessageQueue {
   }
 
   async handleFatalSandboxFailure(reason: string): Promise<void> {
+    // Identified before termination, which may yield on provider I/O. A
+    // sandbox serving a prompt, or still confirming a stopped one, was not
+    // booting for the next one; the served prompt is already settled or is
+    // failStuckProcessingMessage's to settle.
+    const servingPrompt =
+      this.messageRepository.getProcessingMessage() ??
+      this.messageRepository.getMessageAwaitingStopConfirmation();
+    const bootPrompt = servingPrompt ? null : this.messageRepository.getNextPendingMessage();
     const termination = this.sandboxLifecycle.terminateFailedSandbox(reason);
     await this.failStuckProcessingMessage(reason);
-    if (await termination) await this.executionStop.resumeAfterSandboxTermination();
+    await applySandboxRecovery(
+      { messageQueue: this, executionStop: this.executionStop },
+      bootPrompt,
+      await termination
+    );
   }
 
   /** Close every unfinished message synchronously; status projection happens afterwards. */
@@ -572,6 +660,23 @@ export class SessionMessageQueue {
     this.broadcastPromptQueue();
     const sandboxWs = this.wsManager.getSandboxSocket();
     if (sandboxWs) this.wsManager.send(sandboxWs, { type: "stop" });
+  }
+
+  /**
+   * Fail one pending prompt, the one a sandbox boot that gave up was going to
+   * run. Named by id, not by queue position: the caller identified it before
+   * the lifecycle work that may have yielded, and a prompt cancelled or
+   * dispatched in the meantime is left alone. Later prompts stay pending and
+   * dispatch on the user's next spawn, the same way a failed turn leaves the
+   * queue today. Does not pump the queue — the caller has just failed the
+   * sandbox, and the next spawn is the user's to start.
+   */
+  async failPendingMessage(messageId: string, error: string): Promise<void> {
+    const message = this.messageRepository.getMessageById(messageId);
+    if (!message || message.status !== "pending") return;
+    if (!this.failMessage(message, error, Date.now(), "pending")) return;
+    this.broadcastPromptQueue();
+    await this.sessionStatus.reconcileAfterExecution(false);
   }
 
   /**
@@ -640,10 +745,19 @@ export class SessionMessageQueue {
 
   async enqueuePromptFromApi(
     data: EnqueuePromptRequest
-  ): Promise<{ messageId: string; status: "queued" }> {
+  ): Promise<{ messageId: string; status: "queued"; deduplicated: boolean }> {
     this.assertPromptableSession();
-    this.assertBudgetAvailable();
-    this.assertQueueCapacity();
+    this.assertSandboxAcceptingPrompts();
+    // A request id naming a prompt already queued is answered by enqueuePromptCore's
+    // idempotency lookup, whatever the budget or capacity is now. New work is refused
+    // here, before any participant changes.
+    if (
+      !data.clientRequestId ||
+      !this.messageRepository.getMessageByClientRequestId(data.clientRequestId)
+    ) {
+      this.assertBudgetAvailable();
+      this.assertQueueCapacity();
+    }
     let participant = this.participantService.getByUserId(data.authorId);
     if (!participant) {
       const name = data.scmEnrichment?.name || data.authorId;
@@ -664,14 +778,12 @@ export class SessionMessageQueue {
 
     if (data.scmEnrichment !== undefined) {
       const enrichment = data.scmEnrichment;
-      this.participantRepository.updateParticipantCoalesce(participant.id, {
+      this.participantRepository.updateParticipantIdentity(participant.id, {
+        canonicalUserId: data.canonicalUserId ?? participant.canonical_user_id ?? null,
         scmName: enrichment.name,
         scmEmail: enrichment.email,
         scmLogin: enrichment.login,
         scmUserId: enrichment.userId,
-        scmAccessTokenEncrypted: enrichment.accessTokenEncrypted,
-        scmRefreshTokenEncrypted: enrichment.refreshTokenEncrypted,
-        scmTokenExpiresAt: enrichment.tokenExpiresAt,
       });
       participant = this.participantRepository.getParticipantById(participant.id) ?? participant;
     }
@@ -685,17 +797,72 @@ export class SessionMessageQueue {
       reasoningEffort: data.reasoningEffort,
       attachments: data.attachments,
       callbackContext: data.callbackContext,
+      clientRequestId: data.clientRequestId,
     });
 
+    // An already-active session keeps its index timestamp through the status sync, so
+    // record the activity here: session continuity measures its window from it.
+    this.touchSessionActivity();
     await this.processMessageQueue();
 
-    return { messageId: enqueued.messageId, status: "queued" };
+    return { messageId: enqueued.messageId, status: "queued", deduplicated: enqueued.deduplicated };
+  }
+
+  /** The original message for a retried clientRequestId, or a conflict if the request differs. */
+  private findDuplicatePrompt(
+    data: EnqueuePromptCoreData,
+    requestFingerprint: string | undefined
+  ): EnqueuedPrompt | null {
+    if (!data.clientRequestId) return null;
+    const queueDepthBefore = this.messageRepository.getPendingOrProcessingCount();
+    const existing = this.messageRepository.getMessageByClientRequestId(data.clientRequestId);
+    if (existing) {
+      if (
+        existing.author_id !== data.participant.id ||
+        existing.request_fingerprint !== requestFingerprint
+      ) {
+        this.log.warn("prompt.enqueue", {
+          event: "prompt.enqueue",
+          outcome: "conflict",
+          source: data.source,
+          queue_depth_before: queueDepthBefore,
+          queue_depth_after: queueDepthBefore,
+        });
+        throw new PromptRequestConflictError();
+      }
+      this.log.info("prompt.enqueue", {
+        event: "prompt.enqueue",
+        outcome: "deduplicated",
+        source: data.source,
+        queue_depth_before: queueDepthBefore,
+        queue_depth_after: queueDepthBefore,
+      });
+      return {
+        messageId: existing.id,
+        position: this.messageRepository.getUnfinishedMessagePosition(existing.id),
+        deduplicated: true,
+      };
+    }
+    return null;
   }
 
   private async enqueuePromptCore(data: EnqueuePromptCoreData): Promise<EnqueuedPrompt> {
+    const session = this.repository.getSession();
+    const harness = getValidHarnessOrDefault(session?.harness);
+    const strictSelection = getHarnessCapabilities(harness).selectionPolicy === "strict";
     let requestFingerprint: string | undefined;
     if (data.clientRequestId) {
       requestFingerprint = await fingerprintWebPrompt(data.participant.id, data);
+    }
+    if (strictSelection) {
+      // A retry of an accepted request returns its original message before the
+      // mutable model/auth policy is consulted: it is not new work.
+      const duplicate = this.findDuplicatePrompt(data, requestFingerprint);
+      if (duplicate) return duplicate;
+      const modelError = await this.getProviderAuthenticationError(
+        data.model || session?.model || DEFAULT_MODEL
+      );
+      if (modelError) throw new HarnessModelIncompatibleError(modelError);
     }
 
     // Keep the promptability check, idempotency lookup, budget and capacity
@@ -704,36 +871,12 @@ export class SessionMessageQueue {
     // cancel or archive can land while this request is suspended, so the
     // session is read after it, not before.
     this.assertPromptableSession();
+    this.assertSandboxAcceptingPrompts();
     const queueDepthBefore = this.messageRepository.getPendingOrProcessingCount();
-    if (data.clientRequestId) {
-      const existing = this.messageRepository.getMessageByClientRequestId(data.clientRequestId);
-      if (existing) {
-        if (
-          existing.author_id !== data.participant.id ||
-          existing.request_fingerprint !== requestFingerprint
-        ) {
-          this.log.warn("prompt.enqueue", {
-            event: "prompt.enqueue",
-            outcome: "conflict",
-            source: data.source,
-            queue_depth_before: queueDepthBefore,
-            queue_depth_after: queueDepthBefore,
-          });
-          throw new PromptRequestConflictError();
-        }
-        this.log.info("prompt.enqueue", {
-          event: "prompt.enqueue",
-          outcome: "deduplicated",
-          source: data.source,
-          queue_depth_before: queueDepthBefore,
-          queue_depth_after: queueDepthBefore,
-        });
-        return {
-          messageId: existing.id,
-          position: this.messageRepository.getUnfinishedMessagePosition(existing.id),
-        };
-      }
-    }
+    // Also rechecked after the policy await: a concurrent identical request may
+    // have been inserted while this one was suspended.
+    const raced = this.findDuplicatePrompt(data, requestFingerprint);
+    if (raced) return raced;
     this.assertBudgetAvailable();
     this.assertQueueCapacity(queueDepthBefore);
     const resolvedAttachments = resolveSessionAttachments(
@@ -746,12 +889,9 @@ export class SessionMessageQueue {
 
     let messageModel: string | null = null;
     if (data.model) {
-      if (isValidModel(data.model)) {
-        // An override the session's harness cannot run is a user-visible
-        // rejection, never a silent fallback to a model it can run.
-        const harness = getValidHarnessOrDefault(this.repository.getSession()?.harness);
-        const incompatibility = checkHarnessCompatibility(harness, data.model);
-        if (incompatibility) throw new HarnessModelIncompatibleError(incompatibility.message);
+      if (strictSelection || isValidModel(data.model)) {
+        // Preserve strict overrides so compatibility rejects them below,
+        // rather than silently substituting the session's model.
         messageModel = data.model;
       } else {
         this.log.warn("Invalid message model, ignoring override", { model: data.model });
@@ -760,10 +900,22 @@ export class SessionMessageQueue {
 
     const effectiveModelForEffort =
       messageModel || this.repository.getSession()?.model || DEFAULT_MODEL;
+    const incompatibility = checkHarnessPromptCompatibility(
+      harness,
+      effectiveModelForEffort,
+      data.reasoningEffort ??
+        inheritReasoningEffort(
+          harness,
+          effectiveModelForEffort,
+          this.repository.getSession()?.reasoning_effort
+        )
+    );
+    if (incompatibility) throw new HarnessModelIncompatibleError(incompatibility.message);
     const messageReasoningEffort = validateReasoningEffort(
       effectiveModelForEffort,
       data.reasoningEffort,
-      this.log
+      this.log,
+      getValidHarnessOrDefault(this.repository.getSession()?.harness)
     );
     try {
       this.messageRepository.createMessageWithAttachments(
@@ -814,7 +966,18 @@ export class SessionMessageQueue {
       queue_depth_after: position,
     });
 
-    return { messageId, position };
+    return { messageId, position, deduplicated: false };
+  }
+
+  /** Refresh the session index's activity timestamp in the background. */
+  private touchSessionActivity(): void {
+    const session = this.repository.getSession();
+    const sessionId = session?.session_name || session?.id;
+    if (!sessionId) return;
+    this.backgroundTasks.submit(() => this.sessionIndex.touchUpdatedAt(sessionId), {
+      name: "session_index.touch_updated_at",
+      context: { session_id: sessionId },
+    });
   }
 
   private assertBudgetAvailable(): void {
@@ -842,6 +1005,11 @@ export class SessionMessageQueue {
     if (session && !isSessionPromptable(session.status)) {
       throw new SessionNotPromptableError(session.status);
     }
+  }
+
+  private assertSandboxAcceptingPrompts(): void {
+    const reason = this.getSandboxPromptBlockReason();
+    if (reason) throw new SandboxPromptBlockedError(reason);
   }
 
   private assertQueueCapacity(

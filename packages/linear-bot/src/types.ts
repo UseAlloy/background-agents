@@ -3,12 +3,13 @@
  */
 
 import type { ControlPlaneFetcher } from "@open-inspect/shared/service-auth";
+import type { ClassificationEnv } from "@open-inspect/shared/classification";
 import { z } from "zod";
 
 /**
  * Cloudflare Worker environment bindings.
  */
-export interface Env {
+export interface Env extends ClassificationEnv {
   // KV namespace for config, runtime-token cache, and issue-to-session mapping
   LINEAR_KV: KVNamespace;
 
@@ -32,14 +33,6 @@ export interface Env {
   // Secrets
   LINEAR_WEBHOOK_SECRET: string;
   LINEAR_API_KEY?: string; // kept for backward compat / fallback
-  /**
-   * Classifier provider credentials. The deployment binds exactly the one
-   * `CLASSIFICATION_MODEL` selects, so each is optional on its own and the
-   * classifier guards the branch it needs.
-   */
-  ANTHROPIC_API_KEY?: string;
-  CLASSIFICATION_MODEL?: string; // Optional override; defaults to DEFAULT_CLASSIFICATION_MODEL
-  OPENAI_API_KEY?: string;
   SERVICE_AUTH_SECRET?: string; // Per-service sig1 signing secret; also verifies CP callbacks
   LOG_LEVEL?: string;
 }
@@ -108,6 +101,11 @@ export type ProjectRepoMapping = Record<string, z.infer<typeof projectTargetSche
 
 // ─── Issue-to-Session Mapping ────────────────────────────────────────────────
 
+export interface LinearChannelScope {
+  linearTeamId: string;
+  actorUserId?: string;
+}
+
 /**
  * The issue→session mapping persisted in KV. Canonical as a schema because the
  * stored value is untrusted on read: `lookupIssueSession` parses with this, so
@@ -117,6 +115,8 @@ export const issueSessionSchema = z.object({
   sessionId: z.string(),
   issueId: z.string(),
   issueIdentifier: z.string(),
+  /** External Linear team coordinate; optional for mappings stored before bindings. */
+  linearTeamId: z.string().trim().min(1).optional(),
   /** Set for repository sessions; absent for environment sessions. */
   repoOwner: z.string().optional(),
   repoName: z.string().optional(),

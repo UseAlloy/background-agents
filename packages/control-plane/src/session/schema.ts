@@ -56,7 +56,31 @@ const TERMINAL_MESSAGE_PROJECTION_TABLE_SQL = `CREATE TABLE IF NOT EXISTS termin
   next_attempt_at INTEGER NOT NULL
 );`;
 
+const STEP_USAGE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS step_usage (
+  id TEXT PRIMARY KEY,
+  message_id TEXT,
+  model TEXT,
+  harness TEXT,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  total_tokens INTEGER,
+  step_cost_usd REAL,
+  message_cost_usd REAL,
+  is_subtask INTEGER NOT NULL DEFAULT 0,
+  child_session_id TEXT,
+  task_call_id TEXT,
+  reason TEXT,
+  created_at INTEGER NOT NULL
+)`;
+
 export const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS sandbox_preservation (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  state TEXT NOT NULL
+);
 -- Core session state
 CREATE TABLE IF NOT EXISTS session (
   id TEXT PRIMARY KEY,                              -- Same as DO ID
@@ -74,6 +98,7 @@ CREATE TABLE IF NOT EXISTS session (
   model TEXT DEFAULT 'anthropic/claude-haiku-4-5',   -- LLM model to use
   reasoning_effort TEXT,                            -- Session-level reasoning effort default
   status TEXT DEFAULT 'created',                    -- 'created', 'active', 'completed', 'failed', 'archived', 'cancelled'
+  status_revision INTEGER NOT NULL DEFAULT 1,
   parent_session_id TEXT,                           -- Parent session ID (NULL for top-level)
   spawn_source TEXT NOT NULL DEFAULT 'user',        -- 'user' or 'agent'
   spawn_depth INTEGER NOT NULL DEFAULT 0,           -- 0 for top-level, parent.depth + 1 for children
@@ -151,10 +176,13 @@ CREATE TABLE IF NOT EXISTS events (
   timeline_sequence INTEGER NOT NULL UNIQUE
 );
 
+-- Per-step usage, distinct from the timeline and from cumulative session cost.
+${STEP_USAGE_TABLE_SQL};
+
 -- Artifacts (PRs, screenshots, video recordings, preview URLs)
 CREATE TABLE IF NOT EXISTS artifacts (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL,                               -- 'pr', 'screenshot', 'video', 'preview', 'branch'
+  type TEXT NOT NULL,                               -- validated by shared artifactTypeSchema
   url TEXT,
   metadata TEXT,                                    -- JSON
   created_at INTEGER NOT NULL,
@@ -194,6 +222,10 @@ CREATE TABLE IF NOT EXISTS sandbox (
   ttyd_url TEXT,                                    -- ttyd proxy tunnel URL
   ttyd_token TEXT,                                  -- Encrypted JWT token for ttyd auth
   active_socket_id TEXT,                            -- Bridge socket the session dispatches to (socket:<id> tag)
+  boot_phase TEXT,                                  -- JSON SandboxBootPhase the runtime last reported; NULL once ready
+  boot_seq INTEGER,                                 -- Sequence of that report, for de-duplicating resends
+  fenced INTEGER NOT NULL DEFAULT 0,                -- 1 once the generation's credentials were revoked for good (boot budget)
+  startup_rejected INTEGER NOT NULL DEFAULT 0,        -- rejected startup retains a cleanup obligation
   created_at INTEGER NOT NULL
 );
 
@@ -232,6 +264,7 @@ CREATE TABLE IF NOT EXISTS ws_client_mapping (
 const INDEXES_SQL = `
 CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
 CREATE INDEX IF NOT EXISTS idx_messages_author ON messages(author_id);
+CREATE INDEX IF NOT EXISTS idx_messages_created_at_id ON messages(created_at DESC, id DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_request_id
 ON messages(client_request_id) WHERE client_request_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_one_processing
@@ -244,6 +277,8 @@ CREATE INDEX IF NOT EXISTS idx_events_message ON events(message_id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_timeline_sequence ON events(timeline_sequence);
+CREATE INDEX IF NOT EXISTS idx_step_usage_message ON step_usage(message_id);
+CREATE INDEX IF NOT EXISTS idx_step_usage_created ON step_usage(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_participants_user ON participants(user_id);
 `;
 
@@ -278,6 +313,17 @@ function parseSqlColumnNames(rows: unknown[]): string[] {
       );
     }
     return row.name;
+  });
+}
+
+function parseAppliedMigrationIds(rows: unknown[]): number[] {
+  return rows.map((row, index) => {
+    if (!isRecord(row) || typeof row.id !== "number") {
+      throw new TypeError(
+        `Invalid schema migration metadata at row ${index}: expected an object with a numeric id`
+      );
+    }
+    return row.id;
   });
 }
 
@@ -688,7 +734,58 @@ export const MIGRATIONS: readonly SchemaMigration[] = [
       }
     },
   },
+  {
+    id: 51,
+    description: "Fence session status projections independently of activity",
+    run: `ALTER TABLE session ADD COLUMN status_revision INTEGER NOT NULL DEFAULT 1`,
+  },
+  {
+    id: 52,
+    description: "Add sandbox boot phase, boot sequence and generation fence",
+    run: (sql) => {
+      runMigration(sql, `ALTER TABLE sandbox ADD COLUMN boot_phase TEXT`);
+      runMigration(sql, `ALTER TABLE sandbox ADD COLUMN boot_seq INTEGER`);
+      runMigration(sql, `ALTER TABLE sandbox ADD COLUMN fenced INTEGER NOT NULL DEFAULT 0`);
+    },
+  },
+  {
+    id: 53,
+    description: "Remove persisted boot hook output tails",
+    run: removePersistedHookOutputTails,
+  },
+  {
+    id: 54,
+    description: "Persist final sandbox preservation and expiry fence",
+    run: `CREATE TABLE IF NOT EXISTS sandbox_preservation (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1), state TEXT NOT NULL
+    )`,
+  },
+  {
+    id: 55,
+    description: "Persist per-step usage in the session",
+    run: STEP_USAGE_TABLE_SQL,
+  },
+  {
+    id: 56,
+    description: "Retain rejected sandbox startup cleanup intent",
+    run: "ALTER TABLE sandbox ADD COLUMN startup_rejected INTEGER NOT NULL DEFAULT 0",
+  },
 ];
+
+function removePersistedHookOutputTails(sql: SqlStorage): void {
+  sql.exec(`UPDATE events
+    SET data = CASE
+      WHEN json_valid(data) THEN json_remove(data, '$.outputTail')
+      ELSE data
+    END
+    WHERE type = 'boot_progress' AND instr(data, '"outputTail"') > 0`);
+  sql.exec(`UPDATE sandbox
+    SET boot_phase = CASE
+      WHEN json_valid(boot_phase) THEN json_remove(boot_phase, '$.outputTail')
+      ELSE boot_phase
+    END
+    WHERE boot_phase IS NOT NULL AND instr(boot_phase, '"outputTail"') > 0`);
+}
 
 /**
  * Run a migration statement, only ignoring "column already exists" errors.
@@ -716,8 +813,9 @@ export function applyMigrations(sql: SqlStorage): void {
     `CREATE TABLE IF NOT EXISTS _schema_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`
   );
 
-  const rows = sql.exec(`SELECT id FROM _schema_migrations`).toArray() as Array<{ id: number }>;
-  const applied = new Set(rows.map((r) => r.id));
+  const applied = new Set(
+    parseAppliedMigrationIds(sql.exec(`SELECT id FROM _schema_migrations`).toArray())
+  );
 
   for (const migration of MIGRATIONS) {
     if (applied.has(migration.id)) continue;
@@ -742,5 +840,7 @@ export function applyMigrations(sql: SqlStorage): void {
 export function initSchema(sql: SqlStorage): void {
   sql.exec(SCHEMA_SQL);
   applyMigrations(sql);
+  // Reapply the idempotent scrub so rollback-era writes cannot survive a redeploy.
+  removePersistedHookOutputTails(sql);
   sql.exec(INDEXES_SQL);
 }

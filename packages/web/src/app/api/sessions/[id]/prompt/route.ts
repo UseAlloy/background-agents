@@ -1,10 +1,10 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
-import { getServerAuthSession } from "@/lib/server-auth-session";
 import {
   BLANK_PROMPT_MESSAGE,
   isBlankPrompt,
   promptContentSchema,
+  promptValidationError,
 } from "@open-inspect/shared/types/prompts";
 import { sessionAttachmentReferencesSchema } from "@open-inspect/shared/types/session-attachments";
 import { z } from "zod";
@@ -23,32 +23,33 @@ const promptRequestSchema = z
   });
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const session = await getServerAuthSession();
-  if (!session?.user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   const { id: sessionId } = await params;
 
   try {
-    const parsed = promptRequestSchema.safeParse(await request.json());
+    const raw = await request.json();
+    const parsed = promptRequestSchema.safeParse(raw);
     if (!parsed.success) {
-      return NextResponse.json({ error: "Invalid prompt request" }, { status: 400 });
+      return NextResponse.json(promptValidationError(parsed.error, raw), {
+        status: 400,
+      });
     }
     const { content, model, reasoningEffort, attachments } = parsed.data;
 
     // authorId is derived by the control plane from the Bearer principal and
     // is rejected in the body under strict enforcement.
-    const response = await controlPlaneUserFetch(`/sessions/${sessionId}/prompt`, {
-      method: "POST",
-      body: JSON.stringify({
-        content,
-        source: "web",
-        model,
-        reasoningEffort,
-        attachments,
-      }),
-    });
+    const response = await controlPlaneUserFetch(
+      `/sessions/${encodeURIComponent(sessionId)}/prompt`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          content,
+          source: "web",
+          model,
+          reasoningEffort,
+          attachments,
+        }),
+      }
+    );
 
     if (!response.ok) {
       const errorBody = await response.json().catch(() => null);

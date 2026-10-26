@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { describeCron } from "@open-inspect/shared/cron";
+import { describeAutomationSchedule } from "@/lib/automation-schedule";
 import { GITHUB_WEBHOOK_EVENT_CATALOG } from "@open-inspect/shared/triggers";
 import type { Automation, AutomationListItem } from "@open-inspect/shared/types/automations";
 import { AutomationStatusBadge } from "@/components/automations/automation-status-badge";
@@ -26,12 +26,13 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { FolderIcon, BoxIcon, ClockIcon, BoltIcon, MoreIcon } from "@/components/ui/icons";
 import { useEnvironments } from "@/hooks/use-environments";
-import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
-import { canAccessAutomation } from "@/lib/automation-authorization";
 import { formatFutureRelativeTime } from "@/lib/time";
 import { formatAutomationTargetsLabel } from "@/lib/repo-label";
+import { automationNavigation } from "@/lib/automation-navigation";
 
 interface AutomationsListProps {
+  teamId?: string;
+  canCreate: boolean;
   automations: AutomationListItem[];
   emptyState: { kind: "no-automations" } | { kind: "no-search-results"; nameSearch: string };
   onPause: (id: string) => void;
@@ -48,8 +49,8 @@ const GITHUB_EVENT_LABELS: Record<string, string> = Object.fromEntries(
 );
 
 function describeTrigger(automation: Automation): string {
-  if (automation.triggerType === "schedule" && automation.scheduleCron) {
-    return describeCron(automation.scheduleCron, automation.scheduleTz);
+  if (automation.triggerType === "schedule") {
+    return describeAutomationSchedule(automation);
   }
 
   const TRIGGER_LABELS: Record<string, string> = {
@@ -81,7 +82,7 @@ function describeCompactTrigger(automation: Automation): string {
     return describeTrigger(automation);
   }
 
-  return describeCron(automation.scheduleCron, automation.scheduleTz, { compact: true });
+  return describeAutomationSchedule(automation, { compact: true });
 }
 
 export function AutomationsList({
@@ -91,15 +92,14 @@ export function AutomationsList({
   onResume,
   onTrigger,
   onDelete,
+  teamId,
+  canCreate,
 }: AutomationsListProps) {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const { environments } = useEnvironments();
-  const { authorization, hasPermission } = useCurrentUserAuthorization();
-  const canCreate = hasPermission("automations.create");
+  const { environments } = useEnvironments({ ownerTeamId: teamId });
+  const navigation = automationNavigation(teamId);
   const automationToDelete = automations.find(
-    (automation) =>
-      automation.id === confirmDeleteId &&
-      canAccessAutomation("automations.manage", authorization, automation)
+    (automation) => automation.id === confirmDeleteId && automation.capabilities.canManage
   );
 
   if (automations.length === 0) {
@@ -123,10 +123,10 @@ export function AutomationsList({
         {canCreate && (
           <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
             <Button size="sm" asChild>
-              <Link href="/automations/templates">Start from a template</Link>
+              <Link href={navigation.templates}>Start from a template</Link>
             </Button>
             <Button variant="outline" size="sm" asChild>
-              <Link href="/automations/new">Create Automation</Link>
+              <Link href={navigation.new()}>Create Automation</Link>
             </Button>
           </div>
         )}
@@ -138,15 +138,14 @@ export function AutomationsList({
     <>
       <div className="border border-border-muted rounded-md bg-card divide-y divide-border-muted">
         {automations.map((automation) => {
-          const canManage = canAccessAutomation("automations.manage", authorization, automation);
-          const canTrigger = canAccessAutomation("automations.trigger", authorization, automation);
+          const { canManage, canTrigger } = automation.capabilities;
           return (
             <div key={automation.id} className="px-4 py-4">
               {/* Header: Name + badge | Actions */}
               <div className="flex items-start justify-between gap-3 sm:items-center sm:gap-4">
                 <div className="flex min-w-0 items-center gap-2">
                   <Link
-                    href={`/automations/${automation.id}`}
+                    href={navigation.detail(automation.id)}
                     className="font-medium text-foreground hover:text-accent transition truncate"
                   >
                     {automation.name}
